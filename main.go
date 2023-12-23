@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -47,8 +48,8 @@ type Node struct {
 	votedFor         string
 	id               string
 	majorityReached  chan bool
-	voteCount        int
 	stepDown         chan bool
+	votesReceived    map[string]bool
 }
 
 func main() {
@@ -79,7 +80,7 @@ func main() {
 		id:               *nodeID,
 		majorityReached:  make(chan bool, 1),
 		stepDown:         make(chan bool, 1),
-		voteCount:        0,
+		votesReceived:    make(map[string]bool),
 	}
 	node.electionTimer = time.AfterFunc(node.heartbeatTimeout, func() {
 		node.becomeCandidate()
@@ -145,7 +146,7 @@ func (n *Node) handleConnection(conn net.Conn) {
 			log.Printf("Error decoding vote response: %v", err)
 			return
 		}
-		n.handleVoteResponse(vr)
+		n.handleVoteResponse(vr, strings.Split(conn.RemoteAddr().String(), ":")[0])
 	case "HeartbeatResponse":
 		var hr HeartbeatResponse
 		err := gob.NewDecoder(conn).Decode(&hr)
@@ -159,11 +160,11 @@ func (n *Node) handleConnection(conn net.Conn) {
 
 func (n *Node) becomeCandidate() {
 	n.state = Candidate
-	n.voteCount = 1
 	n.currentTerm++
 	n.votedFor = n.id
 	n.resetElectionTimer()
 	n.requestVotes()
+	n.votesReceived[n.id] = true
 
 	go n.awaitMajority()
 }
@@ -314,7 +315,7 @@ func (n *Node) handleHeartbeat(conn net.Conn, hb Heartbeat) {
 	n.resetElectionTimer()
 }
 
-func (n *Node) handleVoteResponse(response VoteResponse) {
+func (n *Node) handleVoteResponse(response VoteResponse, voterID string) {
 	if response.Term > n.currentTerm {
 		n.currentTerm = response.Term
 		n.state = Follower
@@ -324,9 +325,11 @@ func (n *Node) handleVoteResponse(response VoteResponse) {
 	}
 
 	if response.VoteGranted {
-		n.voteCount++
-		if n.voteCount > nodes/2 {
-			n.majorityReached <- true
+		if _, ok := n.votesReceived[voterID]; !ok { // Check if vote is from a new node
+			n.votesReceived[voterID] = true
+			if len(n.votesReceived) >= nodes/2+1 {
+				n.majorityReached <- true
+			}
 		}
 	}
 }
@@ -343,6 +346,7 @@ func (n *Node) handleHeartbeatResponse(response HeartbeatResponse) {
 
 func (n *Node) becomeLeader() {
 	n.state = Leader
+	n.stopElectionTimer()
 	go n.startHeartbeats()
 }
 
@@ -351,5 +355,11 @@ func (n *Node) startHeartbeats() {
 	for {
 		<-ticker.C
 		n.sendHeartbeats()
+	}
+}
+
+func (n *Node) stopElectionTimer() {
+	if n.electionTimer != nil {
+		n.electionTimer.Stop()
 	}
 }

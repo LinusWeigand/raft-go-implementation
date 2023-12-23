@@ -7,9 +7,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
-	"net/http"
 	"os"
-	"strconv"
 	"time"
 )
 
@@ -54,11 +52,14 @@ type Node struct {
 }
 
 func main() {
-	// Some notes for my team members:
-	// We use a channel for bool to have a signal where we can react on if the values changes
-	// The communication between nodes goes as follows:
-	// For every message we establish a tcp connection.
-	// First we send the message type (VoteRequest, VoteRequestResponse, Heartbeat, HeartbeatResponse), then the type's struct.
+	/*
+	 Some notes for my team members:
+	 We use a channel for bool to have a signal where we can react on if the values changes.
+	 The go keyword before a function call makes the function run in a new thread.
+	 The communication between nodes goes as follows:
+	 For every Message, Response Pair we establish a tcp connection.
+	 First we send the message type (VoteRequest, VoteRequestResponse, Heartbeat, HeartbeatResponse), then the type's struct.
+	*/
 
 	nodeID := flag.String("nodeid", "", "The ID of this node")
 	flag.Parse()
@@ -137,14 +138,28 @@ func (n *Node) handleConnection(conn net.Conn) {
 			return
 		}
 		n.handleHeartbeat(conn, hb)
+	case "VoteResponse":
+		var vr VoteResponse
+		err := gob.NewDecoder(conn).Decode(&vr)
+		if err != nil {
+			log.Printf("Error decoding vote response: %v", err)
+			return
+		}
+		n.handleVoteResponse(vr)
+	case "HeartbeatResponse":
+		var hr HeartbeatResponse
+		err := gob.NewDecoder(conn).Decode(&hr)
+		if err != nil {
+			log.Printf("Error decoding heartbeat response: %v", err)
+			return
+		}
+		n.handleHeartbeatResponse(hr)
 	}
 }
 
 func (n *Node) becomeCandidate() {
 	n.state = Candidate
 	n.voteCount = 1
-	n.majorityReached = make(chan bool, 1)
-	n.stepDown = make(chan bool, 1)
 	n.currentTerm++
 	n.votedFor = n.id
 	n.resetElectionTimer()
@@ -163,12 +178,10 @@ func (n *Node) awaitMajority() {
 			}
 		case <-n.stepDown:
 			if n.state == Candidate {
-				// Step down from candidacy and become a follower
 				n.state = Follower
 				return
 			}
 		case <-time.After(n.heartbeatTimeout):
-			// Election timeout; start a new election
 			n.becomeCandidate()
 			return
 		}
@@ -252,58 +265,84 @@ func (n *Node) sendHeartbeatMessage(nodeID string) {
 	}
 }
 
-func (n *Node) handleVoteRequest(w http.ResponseWriter, r *http.Request) {
-	// Parse the term and candidate ID from the request
-	candidateTerm, err := strconv.Atoi(r.URL.Query().Get("term"))
-	if err != nil {
-		http.Error(w, "Invalid term", http.StatusBadRequest)
-		return
-	}
-	candidateID := r.URL.Query().Get("candidateId")
-
+func (n *Node) handleVoteRequest(conn net.Conn, vr VoteRequest) {
 	shouldVote := false
-
-	// Compare the candidate's term to the node's current term
-	if candidateTerm >= n.currentTerm {
-		// Update the node's term if the candidate's term is higher
-		if candidateTerm > n.currentTerm {
-			n.currentTerm = candidateTerm
+	if vr.Term >= n.currentTerm {
+		if vr.Term > n.currentTerm {
+			n.currentTerm = vr.Term
 			n.state = Follower
 			n.votedFor = ""
 		}
-
-		// Vote for the candidate if the node hasn't voted for anyone else in this term
-		if n.votedFor == "" || n.votedFor == candidateID {
-			n.votedFor = candidateID
+		if n.votedFor == "" || n.votedFor == vr.CandidateID {
+			n.votedFor = vr.CandidateID
 			shouldVote = true
 		}
 	}
 
-	// Send the vote response
-	if shouldVote {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "Voted for %s", candidateID)
-	} else {
-		http.Error(w, "Vote not granted", http.StatusForbidden)
+	// Send struct
+	voteResponse := VoteResponse{
+		Term:        n.currentTerm,
+		VoteGranted: shouldVote,
+	}
+	err := gob.NewEncoder(conn).Encode(voteResponse)
+	if err != nil {
+		log.Printf("Error sending vote response: %v", err)
+	}
+
+	n.resetElectionTimer()
+}
+
+func (n *Node) handleHeartbeat(conn net.Conn, hb Heartbeat) {
+	success := false
+	if hb.Term >= n.currentTerm {
+		n.currentTerm = hb.Term
+		n.state = Follower
+		n.votedFor = ""
+		success = true
+	}
+
+	// Send struct
+	heartbeatResponse := HeartbeatResponse{
+		Term:    n.currentTerm,
+		Success: success,
+	}
+
+	err := gob.NewEncoder(conn).Encode(heartbeatResponse)
+	if err != nil {
+		log.Printf("Error sending heartbeat response: %v", err)
 	}
 	n.resetElectionTimer()
 }
 
-func (n *Node) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
-	// Example: Extract query parameters (like leaderTerm)
-	// leaderTerm := r.URL.Query().Get("leaderTerm")
+func (n *Node) handleVoteResponse(response VoteResponse) {
+	if response.Term > n.currentTerm {
+		n.currentTerm = response.Term
+		n.state = Follower
+		n.votedFor = ""
+		n.stepDown <- true
+		return
+	}
 
-	// Implement the logic for handling heartbeat here
-	// ...
+	if response.VoteGranted {
+		n.voteCount++
+		if n.voteCount > nodes/2 {
+			n.majorityReached <- true
+		}
+	}
+}
 
-	// Reset the election timer on receiving a heartbeat
-	n.resetElectionTimer()
+func (n *Node) handleHeartbeatResponse(response HeartbeatResponse) {
+	if response.Term > n.currentTerm {
+		n.currentTerm = response.Term
+		n.state = Follower
+		n.votedFor = ""
+		n.stepDown <- true
+		return
+	}
 }
 
 func (n *Node) becomeLeader() {
 	n.state = Leader
-	// Perform any additional actions needed for transitioning to leader
-	// e.g., start sending heartbeats to followers
 	go n.startHeartbeats()
 }
 

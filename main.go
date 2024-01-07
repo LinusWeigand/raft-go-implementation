@@ -12,6 +12,16 @@ import (
 	"time"
 )
 
+// TODO Leader doesn't get majority success responses of heartbeat -> step down
+// TODO Node has log and state
+// TODO Leader sends new log entries to followers
+// TODO Follower append log entries to log
+// TODO Leader commits log entries & writes to state
+// TODO Leader sends commit message to followers
+// TODO Follower commits log entries & writes to state
+// TODO LogIndex in Heartbeat
+// TODO Error Message if prevLogIndex doesn't match -> send log entries from Leader
+
 const (
 	Follower int = iota
 	Candidate
@@ -21,18 +31,25 @@ const (
 const nodes = 3
 
 type Heartbeat struct {
-	Term    int
-	Message string
+	Term         int
+	LeaderID     string
+	prevLogIndex int
+	prevLogTerm  int
+	entries      []LogEntry
+	commitIndex  int
 }
 
 type HeartbeatResponse struct {
-	Term    int
-	Success bool
+	Term             int
+	Success          bool
+	LastCorrectIndex int
 }
 
 type VoteRequest struct {
-	Term        int
-	CandidateID string
+	Term         int
+	CandidateID  string
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 type VoteResponse struct {
@@ -41,15 +58,29 @@ type VoteResponse struct {
 }
 
 type Node struct {
-	state            int
-	heartbeatTimeout time.Duration
-	electionTimer    *time.Timer
-	currentTerm      int
-	votedFor         string
-	id               string
-	majorityReached  chan bool
-	stepDown         chan bool
-	votesReceived    map[string]bool
+	State            int
+	HeartbeatTimeout time.Duration
+	ElectionTimer    *time.Timer
+	CurrentTerm      int
+	VotedFor         string
+	Id               string
+	MajorityReached  chan bool
+	StepDown         chan bool
+	VotesReceived    map[string]bool
+	LastLogIndex     int
+	LastLogTerm      int
+	CommitIndex      int
+	LastCommand      string
+	Entries          Entries
+}
+
+type Entries []LogEntry
+
+type LogEntry struct {
+	Index     int
+	Term      int
+	Command   string
+	Committed bool
 }
 
 func main() {
@@ -62,6 +93,7 @@ func main() {
 	 First we send the message type (VoteRequest, VoteRequestResponse, Heartbeat, HeartbeatResponse), then the type's struct.
 	*/
 
+	//Read flags
 	nodeID := flag.String("nodeid", "", "The ID of this node")
 	flag.Parse()
 
@@ -72,20 +104,54 @@ func main() {
 		fmt.Println("Node ID:", *nodeID)
 	}
 
+	// Initialize node
 	node := &Node{
-		state:            Follower,
-		heartbeatTimeout: time.Duration(rand.Intn(200)+100) * time.Millisecond, // 100ms - 300ms
-		currentTerm:      0,
-		votedFor:         "",
-		id:               *nodeID,
-		majorityReached:  make(chan bool, 1),
-		stepDown:         make(chan bool, 1),
-		votesReceived:    make(map[string]bool),
+		State:            Follower,
+		HeartbeatTimeout: time.Duration(rand.Intn(200)+100) * time.Millisecond, // 100ms - 300ms
+		CurrentTerm:      0,
+		VotedFor:         "",
+		Id:               *nodeID,
+		MajorityReached:  make(chan bool, 1),
+		StepDown:         make(chan bool, 1),
+		VotesReceived:    make(map[string]bool),
+		LastLogIndex:     0,
+		LastLogTerm:      0,
+		CommitIndex:      0,
+		LastCommand:      "",
+		Entries:          Entries{},
 	}
-	node.electionTimer = time.AfterFunc(node.heartbeatTimeout, func() {
+	node.ElectionTimer = time.AfterFunc(node.HeartbeatTimeout, func() {
 		node.becomeCandidate()
 	})
 
+	//Read entries from log.txt
+	file, err := os.Open("log.txt")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func(file *os.File) {
+		err := file.Close()
+		if err != nil {
+			log.Printf("Failed to close file: %v", err)
+		}
+	}(file)
+	for {
+		var index, term int
+		var command string
+		var committed bool
+		_, err := fmt.Fscanf(file, "%d,%d,%s,%t\n", &index, &term, &command, &committed)
+		if err != nil {
+			break
+		}
+		node.Entries.Push(LogEntry{index, term, command, committed})
+		node.LastLogIndex = index
+		node.LastLogTerm = term
+		if committed {
+			node.CommitIndex = index
+		}
+		node.LastCommand = command
+	}
+	go node.listenForStepDown()
 	go node.startServer()
 }
 
@@ -113,7 +179,12 @@ func (n *Node) startServer() {
 }
 
 func (n *Node) handleConnection(conn net.Conn) {
-	defer conn.Close()
+	defer func(conn net.Conn) {
+		err := conn.Close()
+		if err != nil {
+			log.Printf("Failed to close connection: %v", err)
+		}
+	}(conn)
 
 	var msgType string
 	err := gob.NewDecoder(conn).Decode(&msgType)
@@ -159,12 +230,12 @@ func (n *Node) handleConnection(conn net.Conn) {
 }
 
 func (n *Node) becomeCandidate() {
-	n.state = Candidate
-	n.currentTerm++
-	n.votedFor = n.id
+	n.State = Candidate
+	n.CurrentTerm++
+	n.VotedFor = n.Id
 	n.resetElectionTimer()
 	n.requestVotes()
-	n.votesReceived[n.id] = true
+	n.VotesReceived[n.Id] = true
 
 	go n.awaitMajority()
 }
@@ -172,32 +243,31 @@ func (n *Node) becomeCandidate() {
 func (n *Node) awaitMajority() {
 	for {
 		select {
-		case <-n.majorityReached:
-			if n.state == Candidate {
+		case <-n.MajorityReached:
+			if n.State == Candidate {
 				n.becomeLeader()
 				return
 			}
-		case <-n.stepDown:
-			if n.state == Candidate {
-				n.state = Follower
-				return
-			}
-		case <-time.After(n.heartbeatTimeout):
-			n.becomeCandidate()
-			return
 		}
 	}
 }
 
-func (n *Node) resetElectionTimer() {
-	n.electionTimer.Stop()
-	n.electionTimer.Reset(n.heartbeatTimeout)
+func (n *Node) listenForStepDown() {
+	for {
+		select {
+		case <-n.StepDown:
+			if n.State == Leader || n.State == Candidate {
+				n.becomeFollower()
+				return
+			}
+		}
+	}
 }
 
 func (n *Node) requestVotes() {
 	for i := 1; i <= nodes; i++ {
 		nodeID := fmt.Sprintf("node%d", i)
-		if nodeID != n.id {
+		if nodeID != n.Id {
 			go n.sendVoteRequest(nodeID)
 		}
 	}
@@ -210,7 +280,12 @@ func (n *Node) sendVoteRequest(nodeID string) {
 		log.Printf("Failed to connect to %s: %v", nodeID, err)
 		return
 	}
-	defer conn.Close()
+	defer func(conn net.Conn) {
+		err := conn.Close()
+		if err != nil {
+			log.Printf("Failed to close connection: %v", err)
+		}
+	}(conn)
 
 	// Send type
 	err = gob.NewEncoder(conn).Encode("VoteRequest")
@@ -221,8 +296,10 @@ func (n *Node) sendVoteRequest(nodeID string) {
 
 	// Send struct
 	vr := VoteRequest{
-		Term:        n.currentTerm,
-		CandidateID: n.id,
+		Term:         n.CurrentTerm,
+		CandidateID:  n.Id,
+		LastLogIndex: n.LastLogIndex,
+		LastLogTerm:  n.LastLogTerm,
 	}
 	err = gob.NewEncoder(conn).Encode(vr)
 	if err != nil {
@@ -233,7 +310,7 @@ func (n *Node) sendVoteRequest(nodeID string) {
 func (n *Node) sendHeartbeats() {
 	for i := 1; i <= nodes; i++ {
 		nodeID := fmt.Sprintf("node%d", i)
-		if nodeID != n.id {
+		if nodeID != n.Id {
 			go n.sendHeartbeatMessage(nodeID)
 		}
 	}
@@ -246,7 +323,12 @@ func (n *Node) sendHeartbeatMessage(nodeID string) {
 		log.Printf("Failed to connect to %s: %v", nodeID, err)
 		return
 	}
-	defer conn.Close()
+	defer func(conn net.Conn) {
+		err := conn.Close()
+		if err != nil {
+			log.Printf("Failed to close connection: %v", err)
+		}
+	}(conn)
 
 	// Send type
 	err = gob.NewEncoder(conn).Encode("Heartbeat")
@@ -257,8 +339,12 @@ func (n *Node) sendHeartbeatMessage(nodeID string) {
 
 	// Send struct
 	hb := Heartbeat{
-		Term:    n.currentTerm,
-		Message: "Heartbeat",
+		Term:         n.CurrentTerm,
+		LeaderID:     n.Id,
+		prevLogIndex: n.LastLogIndex,
+		prevLogTerm:  n.LastLogTerm,
+		entries:      n.Entries,
+		commitIndex:  n.CommitIndex,
 	}
 	err = gob.NewEncoder(conn).Encode(hb)
 	if err != nil {
@@ -268,21 +354,20 @@ func (n *Node) sendHeartbeatMessage(nodeID string) {
 
 func (n *Node) handleVoteRequest(conn net.Conn, vr VoteRequest) {
 	shouldVote := false
-	if vr.Term >= n.currentTerm {
-		if vr.Term > n.currentTerm {
-			n.currentTerm = vr.Term
-			n.state = Follower
-			n.votedFor = ""
+	if vr.Term >= n.CurrentTerm {
+		if vr.Term > n.CurrentTerm {
+			n.CurrentTerm = vr.Term
+			n.StepDown <- true
 		}
-		if n.votedFor == "" || n.votedFor == vr.CandidateID {
-			n.votedFor = vr.CandidateID
+		if (n.VotedFor == "" || n.VotedFor == vr.CandidateID) && vr.LastLogIndex >= n.LastLogIndex && vr.LastLogTerm >= n.LastLogTerm {
+			n.VotedFor = vr.CandidateID
 			shouldVote = true
 		}
 	}
 
 	// Send struct
 	voteResponse := VoteResponse{
-		Term:        n.currentTerm,
+		Term:        n.CurrentTerm,
 		VoteGranted: shouldVote,
 	}
 	err := gob.NewEncoder(conn).Encode(voteResponse)
@@ -294,21 +379,53 @@ func (n *Node) handleVoteRequest(conn net.Conn, vr VoteRequest) {
 }
 
 func (n *Node) handleHeartbeat(conn net.Conn, hb Heartbeat) {
-	success := false
-	if hb.Term >= n.currentTerm {
-		n.currentTerm = hb.Term
-		n.state = Follower
-		n.votedFor = ""
-		success = true
+	if (n.State == Candidate || n.State == Leader) && hb.Term >= n.CurrentTerm {
+		n.State = Follower
+		n.VotedFor = ""
+		n.StepDown <- true
+		return
 	}
 
+	//if Leader term is smaller, tell Leader to step down
+	if hb.Term < n.CurrentTerm {
+		err := gob.NewEncoder(conn).Encode("HeartbeatResponse")
+		heartbeatResponse := HeartbeatResponse{
+			Term:             n.CurrentTerm,
+			Success:          false,
+			LastCorrectIndex: n.LastLogIndex,
+		}
+		err = gob.NewEncoder(conn).Encode(heartbeatResponse)
+		if err != nil {
+			log.Printf("Error sending heartbeat response: %v", err)
+		}
+		return
+	}
+
+	success := true
+	if hb.Term < n.CurrentTerm || hb.prevLogIndex != n.LastLogIndex || hb.prevLogTerm != n.LastLogTerm {
+		success = false
+	}
+	if n.LastCommand != hb.entries[hb.prevLogIndex].Command {
+		success = false
+		//delete last entry
+		n.Entries.Pop()
+		n.LastLogIndex--
+		n.LastLogTerm = n.Entries[n.LastLogIndex].Term
+		n.LastCommand = n.Entries[n.LastLogIndex].Command
+	}
+
+	// Send type
+	err := gob.NewEncoder(conn).Encode("HeartbeatResponse")
+	if err != nil {
+		log.Printf("Failed to encode message type: %v", err)
+		return
+	}
 	// Send struct
 	heartbeatResponse := HeartbeatResponse{
-		Term:    n.currentTerm,
+		Term:    n.CurrentTerm,
 		Success: success,
 	}
-
-	err := gob.NewEncoder(conn).Encode(heartbeatResponse)
+	err = gob.NewEncoder(conn).Encode(heartbeatResponse)
 	if err != nil {
 		log.Printf("Error sending heartbeat response: %v", err)
 	}
@@ -316,42 +433,40 @@ func (n *Node) handleHeartbeat(conn net.Conn, hb Heartbeat) {
 }
 
 func (n *Node) handleVoteResponse(response VoteResponse, voterID string) {
-	if response.Term > n.currentTerm {
-		n.currentTerm = response.Term
-		n.state = Follower
-		n.votedFor = ""
-		n.stepDown <- true
+	if !response.VoteGranted {
+		n.CurrentTerm = response.Term
+		n.State = Follower
+		n.VotedFor = ""
+		n.StepDown <- true
 		return
 	}
 
-	if response.VoteGranted {
-		if _, ok := n.votesReceived[voterID]; !ok { // Check if vote is from a new node
-			n.votesReceived[voterID] = true
-			if len(n.votesReceived) >= nodes/2+1 {
-				n.majorityReached <- true
-			}
+	if _, ok := n.VotesReceived[voterID]; !ok { // Check if vote is from a new node
+		n.VotesReceived[voterID] = true
+		if len(n.VotesReceived) >= nodes/2+1 {
+			n.MajorityReached <- true
 		}
 	}
 }
 
 func (n *Node) handleHeartbeatResponse(response HeartbeatResponse) {
-	if response.Term > n.currentTerm {
-		n.currentTerm = response.Term
-		n.state = Follower
-		n.votedFor = ""
-		n.stepDown <- true
+	if response.Term > n.CurrentTerm {
+		n.CurrentTerm = response.Term
+		n.State = Follower
+		n.VotedFor = ""
+		n.StepDown <- true
 		return
 	}
 }
 
 func (n *Node) becomeLeader() {
-	n.state = Leader
+	n.State = Leader
 	n.stopElectionTimer()
 	go n.startHeartbeats()
 }
 
 func (n *Node) startHeartbeats() {
-	ticker := time.NewTicker(n.heartbeatTimeout)
+	ticker := time.NewTicker(n.HeartbeatTimeout)
 	for {
 		<-ticker.C
 		n.sendHeartbeats()
@@ -359,7 +474,50 @@ func (n *Node) startHeartbeats() {
 }
 
 func (n *Node) stopElectionTimer() {
-	if n.electionTimer != nil {
-		n.electionTimer.Stop()
+	if n.ElectionTimer != nil {
+		n.ElectionTimer.Stop()
 	}
+}
+
+func (n *Node) becomeFollower() {
+	n.State = Follower
+	n.VotedFor = ""
+	n.VotesReceived = make(map[string]bool)
+	n.resetElectionTimer()
+}
+
+func (n *Node) resetElectionTimer() {
+	n.ElectionTimer.Stop()
+	n.ElectionTimer.Reset(n.HeartbeatTimeout)
+}
+
+func (s *Entries) Push(e LogEntry) {
+	*s = append(*s, e)
+}
+
+func (s *Entries) Pop() (LogEntry, bool) {
+	l := len(*s)
+	if l == 0 {
+		return LogEntry{}, false
+	}
+	e := (*s)[l-1]
+	*s = (*s)[:l-1]
+	return e, true
+}
+
+func (s *Entries) Peek() (LogEntry, bool) {
+	l := len(*s)
+	if l == 0 {
+		return LogEntry{}, false
+	}
+	e := (*s)[l-1]
+	return e, true
+}
+
+func (s *Entries) IsEmpty() bool {
+	return len(*s) == 0
+}
+
+func (s *Entries) Size() int {
+	return len(*s)
 }
